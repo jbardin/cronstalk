@@ -9,21 +9,27 @@ import (
 	"log"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	// "github.com/kr/beanstalk"
+	"github.com/kr/beanstalk"
 )
 
 var (
 	// actuary *beanstalk.Conn
-	debug      = flag.Bool("debug", false, "debug logging")
-	redisAddrs = flag.String("redis", "127.0.0.1:6379", "redis server addresses")
+	debug           = flag.Bool("debug", false, "debug logging")
+	redisAddrs      = flag.String("redis", "127.0.0.1:6379", "redis server addresses")
+	beanstalkdAddrs = flag.String("beanstalkd", "127.0.0.1:11300", "beanstalkd addresses")
 
-	JobRegistry  = make(map[string]*CronJob)
-	RedisServers []string
-	RedisConn    redis.Conn
-	MyId         string
+	JobRegistry       = make(map[string]*CronJob)
+	RedisServers      []string
+	BeanstalkdServers []string
+	RedisConn         redis.Conn
+	BeanstalkdConn    *beanstalk.Conn
+	MyId              string
+
+	SubmitLock sync.Mutex
 )
 
 func randId() string {
@@ -134,7 +140,20 @@ func Schedule(job *CronJob) {
 }
 
 func Submit(job *CronJob) {
+	SubmitLock.Lock()
+	defer SubmitLock.Unlock()
 	log.Println("SUBMIT:", job)
+
+	tube := beanstalk.Tube{
+		BeanstalkdConn,
+		job.Tube,
+	}
+
+	_, err := tube.Put([]byte(job.Body), job.Priority, 0, time.Duration(job.Ttr)*time.Second)
+	if err != nil {
+		log.Println("error submitting job")
+	}
+
 }
 
 // check if we're master.
@@ -237,6 +256,20 @@ func connectRedis() (err error) {
 	return err
 }
 
+// Connect to a beasntalkd server
+func connectBeanstalkd() (err error) {
+	for _, addr := range BeanstalkdServers {
+		BeanstalkdConn, err = beanstalk.Dial("tcp", addr)
+		if err == nil {
+			// we're connected
+			break
+		} else {
+			log.Println("Cannot connect to beanstalkd server", err)
+		}
+	}
+	return err
+}
+
 func logDebug(args ...interface{}) {
 	if !*debug {
 		return
@@ -249,6 +282,10 @@ func Run() {
 
 	// Make sure we have a redis server to start
 	if err := connectRedis(); err != nil {
+		return
+	}
+
+	if err := connectBeanstalkd(); err != nil {
 		return
 	}
 
@@ -273,6 +310,7 @@ func main() {
 	flag.Parse()
 	MyId = randId()
 	RedisServers = strings.Split(*redisAddrs, ",")
+	BeanstalkdServers = strings.Split(*beanstalkdAddrs, ",")
 
 	Run()
 }
