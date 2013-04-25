@@ -2,12 +2,12 @@ package main
 
 import (
 	"crypto/rand"
-	"math/big"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"time"
 
@@ -23,15 +23,14 @@ var (
 	JobRegistry  = make(map[string]*CronJob)
 	RedisServers []string
 	RedisConn    redis.Conn
-	MyId string
+	MyId         string
 )
 
 func randId() string {
-  max := big.NewInt(int64(1<<63 - 1))
-  bigx, _ := rand.Int(rand.Reader, max)
-  return fmt.Sprintf("%x", bigx.Int64())
+	max := big.NewInt(int64(1<<63 - 1))
+	bigx, _ := rand.Int(rand.Reader, max)
+	return fmt.Sprintf("%x", bigx.Int64())
 }
-
 
 // struct to define the json layout of a scheduled job
 type JobSpec struct {
@@ -154,7 +153,6 @@ func Update() error {
 		return errors.New("not connected to a redis server")
 	}
 
-
 	if iAm, err := amMaster(); err != nil {
 		log.Println("error checking for master in redis")
 		return err
@@ -163,7 +161,6 @@ func Update() error {
 		AllStop()
 		return nil
 	}
-
 
 	vals, err := redis.Strings(RedisConn.Do("HGETALL", "cronstalk:schedule"))
 	if err != nil {
