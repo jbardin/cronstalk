@@ -4,8 +4,6 @@
 # Warning: IN PROGRESS
 
 ## TODO
-- Stay connected to redis master when possible
-- Allow multiple cronstalks to run, negotiating for a single master.
 - Round robin option for beanstalkd servers
 
 ## Running
@@ -14,15 +12,15 @@
 
 
 ### Schedule
-Jobs are defined as `name:job` in the `cronstalk:schedule` redis hash. I may change this to use
-the `cronstalk:schedule:*` keyspace, so that TTL can be applied to indiviual jobs.
+Jobs are defined in redis as `key:job` with the keys in the `cronstalk:job:*`
+namespace. This allows jobs to have a TTL in redis.
 
 ### Jobs
 Jobs are JSON encoded, with the following required attributes
 
 ```python
   {
-    "StartTime": "2010-01-01T15:04:05Z",  # start time in RFC3339 format  
+    "StartTime": "2010-01-01T15:04:05Z",  # start time in RFC3339 format
     "Interval": "10m",                    # interval between jobs in hours, minutes, and seconds
     "Tube": "test",                       # beanstalkd tube name
     "Ttr":  120,                          # beanstalkd ttr

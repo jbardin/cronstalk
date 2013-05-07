@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,6 @@ import (
 )
 
 var (
-	// actuary *beanstalk.Conn
 	debug           = flag.Bool("debug", false, "debug logging")
 	redisAddrs      = flag.String("redis", "127.0.0.1:6379", "redis server addresses")
 	beanstalkdAddrs = flag.String("beanstalkd", "127.0.0.1:11300", "beanstalkd addresses")
@@ -29,9 +29,29 @@ var (
 	BeanstalkdConn    *beanstalk.Conn
 	MyId              string
 
+	// this is just a flag for logging the transitions
+	Master bool
+
 	SubmitLock sync.Mutex
 )
 
+// Atomic setting of master, returning True if we got it
+// Sets a 15sec TTL on the master key
+var (
+	atomicCheck = `
+local master = redis.call("GET", "cronstalk:master")
+if (not master) or (master == ARGV[1])
+then
+	redis.call("SET", "cronstalk:master", ARGV[1], "EX", 15)
+	return 1
+else
+	return 0
+end
+`
+	CheckMaster = redis.NewScript(0, atomicCheck)
+)
+
+// generate a random Id for tracking the master
 func randId() string {
 	max := big.NewInt(int64(1<<63 - 1))
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -41,13 +61,16 @@ func randId() string {
 // struct to define the json layout of a scheduled job
 type JobSpec struct {
 	// time to start the scheduled job, in RFC3339 format.
-	StartTime string
+	StartTime string `json:"start_time"`
+
 	// interval between jobs, in 00h00m00s
-	Interval string
-	Tube     string
-	Priority uint32
-	Ttr      int
-	Body     string
+	Interval string `json:"interval"`
+
+	// beanstalkd fields
+	Tube     string `json:"tube"`
+	Priority uint32 `json:"priority"`
+	Ttr      int    `json:"ttr"`
+	Body     string `json:"body"`
 }
 
 type CronJob struct {
@@ -62,13 +85,15 @@ type CronJob struct {
 }
 
 func (j *CronJob) String() string {
-	return j.Key + "->" + string(j.Body)
+	return j.Key
 }
 
+// Stop the shceduler for this job
 func (j *CronJob) Stop() {
 	close(j.stop)
 }
 
+// two jobs are equal if all fields match
 func (j *CronJob) Equals(jobB *CronJob) bool {
 	return ((j.StartTime == jobB.StartTime) &&
 		(j.Interval == jobB.Interval) &&
@@ -89,7 +114,6 @@ func NewJob(key string, jobData []byte) (*CronJob, error) {
 		return nil, err
 	}
 
-	//find the next start time based on the
 	interval, err := time.ParseDuration(jobSpec.Interval)
 	if err != nil {
 		return nil, err
@@ -108,7 +132,7 @@ func NewJob(key string, jobData []byte) (*CronJob, error) {
 	return job, nil
 }
 
-// get the next time this jobs should run, based on the original start time
+// get the next time this job should run, based on the original start time
 // and the interval.
 func (j *CronJob) NextStart() time.Time {
 	now := time.Now()
@@ -119,11 +143,12 @@ func (j *CronJob) NextStart() time.Time {
 	return start
 }
 
+// Start the scheduler for a job
 func Schedule(job *CronJob) {
 	logDebug("scheduling job", job)
 	go func() {
 		start := job.NextStart()
-		logDebug("sleeping until", start)
+		logDebug(job.Key, "sleeping until", start)
 		time.Sleep(start.Sub(time.Now()))
 
 		ticker := time.NewTicker(job.Interval)
@@ -139,76 +164,113 @@ func Schedule(job *CronJob) {
 	}()
 }
 
+// Send the job off to a beanstalkd
+// handle reconnect if needed while we have the SubmitLock
 func Submit(job *CronJob) {
 	SubmitLock.Lock()
 	defer SubmitLock.Unlock()
-	log.Println("SUBMIT:", job)
 
-	tube := beanstalk.Tube{
-		BeanstalkdConn,
-		job.Tube,
+	// previous reconnect failed, so we're nil here
+	if BeanstalkdConn == nil {
+		log.Println("not connected to a beanstalkd server")
+		if err := connectBeanstalkd(); err != nil {
+			return
+		}
 	}
 
-	_, err := tube.Put([]byte(job.Body), job.Priority, 0, time.Duration(job.Ttr)*time.Second)
-	if err != nil {
-		log.Println("error submitting job")
-	}
+	// loop if we need to reconnect
+	for i := 0; i < 2; i++ {
+		tube := beanstalk.Tube{
+			BeanstalkdConn,
+			job.Tube,
+		}
 
+		_, err := tube.Put([]byte(job.Body), job.Priority, 0, time.Duration(job.Ttr)*time.Second)
+		if _, ok := err.(beanstalk.ConnError); ok {
+			log.Println(err)
+			// attempt to reconnect on a Connection Error
+			connectBeanstalkd()
+			continue
+		}
+
+		if err != nil {
+			// anything else is fatal
+			log.Println("error submitting job", err)
+			return
+		}
+
+		// we're OK now
+		logDebug("SUBMITED:", fmt.Sprintf("%s(%s)", job.Key, string(job.Body)))
+		return
+	}
 }
 
-// check if we're master.
-// elect a new one if no master is found.
-// TODO: multiple cronstalks not yet supported
-func amMaster() (bool, error) {
-	return true, nil
+func getJobs() (jobs map[string]string, err error) {
+	jobs = make(map[string]string)
+	var keys []string
+	var val string
+
+	keys, err = redis.Strings(RedisConn.Do("KEYS", "cronstalk:job:*"))
+	if err != nil {
+		log.Println("error updating jobs from redis")
+		return
+	}
+
+	for _, key := range keys {
+		val, err = redis.String(RedisConn.Do("GET", key))
+		if err != nil {
+			log.Printf("error getting job \"%s\": %s\n", key, err)
+			return
+		}
+		jobs[key] = val
+	}
+	return
 }
 
 // Retrieve all jobs from redis, and schedule them accordingly.
 // Update any jobs that have changed, and remove jobs no longer in the database.
 // Return error on any connection problems.
 func Update() error {
-	logDebug("updating")
+	logDebug("Update")
 	if RedisConn == nil {
 		return errors.New("not connected to a redis server")
 	}
 
-	if iAm, err := amMaster(); err != nil {
+	// Check if we're master
+	if ok, err := redis.Bool(CheckMaster.Do(RedisConn, MyId)); err != nil {
 		log.Println("error checking for master in redis")
 		return err
-	} else if !iAm {
-		logDebug("not master")
-		AllStop()
+	} else if !ok {
+		if Master {
+			Master = false
+			log.Printf("%s no longer master\n", MyId)
+			AllStop()
+		}
+		logDebug(MyId + " not master")
 		return nil
 	}
 
-	vals, err := redis.Strings(RedisConn.Do("HGETALL", "cronstalk:schedule"))
+	if !Master {
+		Master = true
+		log.Printf("%s taking over as master\n", MyId)
+	}
+
+	jobs, err := getJobs()
 	if err != nil {
-		log.Println("error updating jobs from redis")
 		return err
 	}
 
-	// set of jobs current found in the DB
-	current := make(map[string]bool)
-
-	var key string
-	for i, val := range vals {
-		// redis hash results are a slice of [key, val, key, val]
-		if i%2 == 0 {
-			key = val
-			current[key] = true
-			continue
-		}
-
+	for key, val := range jobs {
 		job, err := NewJob(key, []byte(val))
 		if err != nil {
-			log.Printf("error creating job from %s->%s\n", key, val)
+			log.Printf("error creating job from %s(%s)\n", key, val)
 			continue
 		}
 
 		oldJob, ok := JobRegistry[key]
 		if ok {
 			if oldJob.Equals(job) {
-				logDebug("job already scheduled", job)
+				logDebug("job already scheduled:", job)
 				continue
 			} else {
 				// delete the job, we'll create a new one further down
@@ -224,7 +286,7 @@ func Update() error {
 
 	// now cancel any old jobs we didn't find
 	for key, job := range JobRegistry {
-		if _, ok := current[key]; !ok {
+		if _, ok := jobs[key]; !ok {
 			logDebug("removing job", key, "from schedule")
 			job.Stop()
 			delete(JobRegistry, key)
@@ -234,40 +296,75 @@ func Update() error {
 	return nil
 }
 
+// Stop all jobs, and remove them from the registry
 func AllStop() {
-	log.Println("stopping all scheduled jobs")
+	if len(JobRegistry) > 0 {
+		log.Println("stopping all scheduled jobs")
+	}
 	for k, j := range JobRegistry {
 		j.Stop()
 		delete(JobRegistry, k)
 	}
 }
 
-// Connect, or re-connect to a redis server
-func connectRedis() (err error) {
-	for _, addr := range RedisServers {
-		RedisConn, err = redis.Dial("tcp", addr)
-		if err == nil {
-			// we're connected
-			break
-		} else {
-			log.Println("Cannot connect to redis server", err)
+// verify is the the connected redis is a Master
+func redisMaster(r redis.Conn) bool {
+	info, err := redis.Bytes(r.Do("INFO"))
+	if err != nil {
+		return false
+	}
+
+	for _, field := range bytes.Fields(info) {
+		kv := bytes.Split(field, []byte(":"))
+		if len(kv) == 2 && bytes.Equal(kv[0], []byte("role")) && bytes.Equal(kv[1], []byte("master")) {
+			return true
 		}
 	}
-	return err
+	return false
+
 }
 
-// Connect to a beasntalkd server
+// Connect, or re-connect to a redis server
+// Take the first server in our list that is a master
+func connectRedis() (err error) {
+	if RedisConn != nil {
+		RedisConn.Close()
+	}
+	for _, addr := range RedisServers {
+		RedisConn, err = redis.Dial("tcp", addr)
+		if err == nil && redisMaster(RedisConn) {
+			logDebug("connected to redis", addr)
+			return
+		} else if err == nil {
+			log.Printf("redis server %s is not master\n", addr)
+		} else {
+			log.Println("cannot connect to a redis server")
+		}
+	}
+
+	log.Println("error: no redis server available")
+	RedisConn = nil
+	return errors.New("no redis master")
+}
+
+// Connect to a beanstalkd server
+// Take the first server in our list with which we can get a connection
 func connectBeanstalkd() (err error) {
+	if BeanstalkdConn != nil {
+		BeanstalkdConn.Close()
+	}
 	for _, addr := range BeanstalkdServers {
 		BeanstalkdConn, err = beanstalk.Dial("tcp", addr)
 		if err == nil {
-			// we're connected
-			break
+			logDebug("connected to beanstalkd", addr)
+			return
 		} else {
-			log.Println("Cannot connect to beanstalkd server", err)
+			log.Println("cannot connect to beanstalkd server", err)
 		}
 	}
-	return err
+
+	log.Println("error: no beanstalkd server available")
+	return
 }
 
 func logDebug(args ...interface{}) {
@@ -280,30 +377,26 @@ func logDebug(args ...interface{}) {
 func Run() {
 	log.Println("cronstalk started")
 
-	// Make sure we have a redis server to start
-	if err := connectRedis(); err != nil {
-		return
-	}
-
-	if err := connectBeanstalkd(); err != nil {
-		return
-	}
+	connectRedis()
+	connectBeanstalkd()
 
 	for {
 		// Update, or reconnect and Update
 		if err := Update(); err != nil {
 			log.Println(err)
 			if err = connectRedis(); err != nil {
-				// stop all jobs on connection error, and try again later
+				// stop all jobs on update error, and try again later
 				AllStop()
 			} else {
-				Update()
+				if err := Update(); err != nil {
+					log.Println(err)
+				}
+
 			}
 		}
 
 		time.Sleep(10 * time.Second)
 	}
-
 }
 
 func main() {
