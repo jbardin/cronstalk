@@ -3,12 +3,12 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +28,8 @@ var (
 	RedisConn         redis.Conn
 	BeanstalkdConn    *beanstalk.Conn
 	MyId              string
+
+	JobError = errors.New("error reading")
 
 	// this is just a flag for logging the transitions
 	Master bool
@@ -56,21 +58,6 @@ func randId() string {
 	max := big.NewInt(int64(1<<63 - 1))
 	bigx, _ := rand.Int(rand.Reader, max)
 	return fmt.Sprintf("%x", bigx.Int64())
-}
-
-// struct to define the json layout of a scheduled job
-type JobSpec struct {
-	// time to start the scheduled job, in RFC3339 format.
-	StartTime string `json:"start_time"`
-
-	// interval between jobs, in 00h00m00s
-	Interval string `json:"interval"`
-
-	// beanstalkd fields
-	Tube     string `json:"tube"`
-	Priority uint32 `json:"priority"`
-	Ttr      int    `json:"ttr"`
-	Body     string `json:"body"`
 }
 
 type CronJob struct {
@@ -103,32 +90,44 @@ func (j *CronJob) Equals(jobB *CronJob) bool {
 		(j.Body == jobB.Body))
 }
 
-func NewJob(key string, jobData []byte) (*CronJob, error) {
-	jobSpec := new(JobSpec)
-	if err := json.Unmarshal(jobData, jobSpec); err != nil {
-		return nil, err
+// take the strings returned from HGETALL and return a CronJob
+func NewJob(key string, jobData []string) (job *CronJob, err error) {
+	job = new(CronJob)
+	job.Key = key
+
+	for i := 0; i < len(jobData)-1; i += 2{
+		switch jobData[i] {
+		case "start_time":
+			job.StartTime, err = time.Parse(time.RFC3339, jobData[i+1])
+			if err != nil {
+				return nil, err
+			}
+		case "interval":
+			job.Interval, err = time.ParseDuration(jobData[i+1])
+			if err != nil {
+				return nil, err
+			}
+		case "tube":
+			job.Tube = jobData[i+1]
+		case "ttr":
+			job.Ttr, err = strconv.Atoi(jobData[i+1])
+			if err != nil {
+				return nil, err
+			}
+		case "priority":
+			p, err := strconv.ParseUint(jobData[i+1], 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			job.Priority = uint32(p)
+		case "body":
+			job.Body = jobData[i+1]
+		}
+
+
 	}
 
-	start, err := time.Parse(time.RFC3339, jobSpec.StartTime)
-	if err != nil {
-		return nil, err
-	}
-
-	interval, err := time.ParseDuration(jobSpec.Interval)
-	if err != nil {
-		return nil, err
-	}
-
-	job := &CronJob{
-		StartTime: start,
-		Interval:  interval,
-		Tube:      jobSpec.Tube,
-		Priority:  jobSpec.Priority,
-		Ttr:       jobSpec.Ttr,
-		Body:      jobSpec.Body,
-		Key:       key,
-		stop:      make(chan bool),
-	}
+	job.stop = make(chan bool)
 	return job, nil
 }
 
@@ -167,8 +166,13 @@ func Schedule(job *CronJob) {
 // Send the job off to a beanstalkd
 // handle reconnect if needed while we have the SubmitLock
 func Submit(job *CronJob) {
+	log.Printf("SUBMIT: %+v\n", job)
 	SubmitLock.Lock()
-	defer SubmitLock.Unlock()
+	log.Println("HOLDING LOCK!")
+	defer func() {
+		log.Println("RELEASED LOCK")
+		SubmitLock.Unlock()
+	}()
 
 	// previous reconnect failed, so we're nil here
 	if BeanstalkdConn == nil {
@@ -195,7 +199,7 @@ func Submit(job *CronJob) {
 
 		if err != nil {
 			// anything else is fatal
-			log.Println("error submitting job", err)
+			log.Println("error submitting job:", err)
 			return
 		}
 
@@ -205,24 +209,32 @@ func Submit(job *CronJob) {
 	}
 }
 
-func getJobs() (jobs map[string]string, err error) {
-	jobs = make(map[string]string)
-	var keys []string
-	var val string
+func getJobs() (jobs map[string]*CronJob, err error) {
+	jobs = make(map[string]*CronJob)
+	var jobKeys []string
+	var jobData []string
 
-	keys, err = redis.Strings(RedisConn.Do("KEYS", "cronstalk:job:*"))
+	jobKeys, err = redis.Strings(RedisConn.Do("SMEMBERS", "cronstalk:jobs"))
 	if err != nil {
 		log.Println("error updating jobs from redis")
 		return
 	}
 
-	for _, key := range keys {
-		val, err = redis.String(RedisConn.Do("GET", key))
+
+	for _, key := range jobKeys {
+		jobData, err = redis.Strings(RedisConn.Do("HGETALL", key))
 		if err != nil {
 			log.Printf("error getting job \"%s\": %s\n", key, err)
-			return
+			continue
 		}
-		jobs[key] = val
+
+		job, err := NewJob(key, jobData)
+		if err != nil {
+			log.Printf("error creating job %s\n", key)
+			continue
+		}
+
+		jobs[key] = job
 	}
 	return
 }
@@ -260,13 +272,7 @@ func Update() error {
 		return err
 	}
 
-	for key, val := range jobs {
-		job, err := NewJob(key, []byte(val))
-		if err != nil {
-			log.Printf("error creating job from %s(%s)\n", key, val)
-			continue
-		}
-
+	for key, job := range jobs {
 		oldJob, ok := JobRegistry[key]
 		if ok {
 			if oldJob.Equals(job) {
@@ -401,6 +407,7 @@ func Run() {
 
 func main() {
 	flag.Parse()
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	MyId = randId()
 	RedisServers = strings.Split(*redisAddrs, ",")
 	BeanstalkdServers = strings.Split(*beanstalkdAddrs, ",")
