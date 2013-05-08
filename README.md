@@ -1,8 +1,6 @@
 # cronstalk
 ## Highly available scheduled jobs for beanstalkd
 
-# Warning: IN PROGRESS
-
 ## TODO
 - Round robin option for beanstalkd servers
 
@@ -16,7 +14,7 @@ Jobs are defined in redis as `key:job` with the keys in the `cronstalk:job:*`
 namespace. This allows jobs to have a TTL in redis.
 
 ### Jobs
-Jobs are JSON encoded, with the following required attributes
+Jobs are stored as a redis hash, with the following required keys:
 
 ```python
   {
@@ -27,4 +25,5 @@ Jobs are JSON encoded, with the following required attributes
     "priority": 12345,                     # beanstalkd priority
     "body": "some data here",              # Job body
   }
-
+```
+The job's key name is found by referencing the redis set "cronstalk:jobs"
