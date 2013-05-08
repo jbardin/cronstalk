@@ -20,11 +20,11 @@ Jobs are JSON encoded, with the following required attributes
 
 ```python
   {
-    "StartTime": "2010-01-01T15:04:05Z",  # start time in RFC3339 format
-    "Interval": "10m",                    # interval between jobs in hours, minutes, and seconds
-    "Tube": "test",                       # beanstalkd tube name
-    "Ttr":  120,                          # beanstalkd ttr
-    "Priority": 12345,                    # beanstalkd priority
-    "Body": "some data here",             # Job body
+    "start_time": "2010-01-01T15:04:05Z",  # start time in RFC3339 format
+    "interval": "10m",                     # interval between jobs in hours, minutes, and seconds
+    "tube": "test",                        # beanstalkd tube name
+    "ttr":  120,                           # beanstalkd ttr
+    "priority": 12345,                     # beanstalkd priority
+    "body": "some data here",              # Job body
   }
 
