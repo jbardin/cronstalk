@@ -94,7 +94,7 @@ func NewJob(key string, jobData []string) (job *CronJob, err error) {
 	job = new(CronJob)
 	job.Key = key
 
-	for i := 0; i < len(jobData)-1; i += 2{
+	for i := 0; i < len(jobData)-1; i += 2 {
 		switch jobData[i] {
 		case "start_time":
 			job.StartTime, err = time.Parse(time.RFC3339, jobData[i+1])
@@ -122,8 +122,6 @@ func NewJob(key string, jobData []string) (job *CronJob, err error) {
 		case "body":
 			job.Body = jobData[i+1]
 		}
-
-
 	}
 
 	job.stop = make(chan bool)
@@ -132,7 +130,7 @@ func NewJob(key string, jobData []string) (job *CronJob, err error) {
 
 // get the next time this job should run, based on the original start time
 // and the interval.
-func (j *CronJob) NextStart() time.Time {
+func (j *CronJob) NextSubmitTime() time.Time {
 	now := time.Now()
 	start := j.StartTime
 	for start.Before(now) {
@@ -145,7 +143,7 @@ func (j *CronJob) NextStart() time.Time {
 func Schedule(job *CronJob) {
 	logDebug("scheduling job", job)
 	go func() {
-		start := job.NextStart()
+		start := job.NextSubmitTime()
 		logDebug(job.Key, "sleeping until", start)
 		time.Sleep(start.Sub(time.Now()))
 
@@ -205,6 +203,12 @@ func Submit(job *CronJob) {
 
 		// we're OK now
 		logDebug("submitted:", job)
+
+		// make an attempt to set last_submit in redis
+		if RedisConn != nil {
+			RedisConn.Do("HSET", job.Key, "last_submit", time.Now().UTC().Format(time.RFC3339))
+		}
+
 		return
 	}
 }
@@ -219,7 +223,6 @@ func getJobs() (jobs map[string]*CronJob, err error) {
 		log.Println("error updating jobs from redis")
 		return
 	}
-
 
 	for _, key := range jobKeys {
 		jobData, err = redis.Strings(RedisConn.Do("HGETALL", key))
@@ -327,7 +330,6 @@ func redisMaster(r redis.Conn) bool {
 		}
 	}
 	return false
-
 }
 
 // Connect, or re-connect to a redis server
