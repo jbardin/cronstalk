@@ -29,7 +29,7 @@ var (
 	BeanstalkdConn    *beanstalk.Conn
 	MyId              string
 
-	JobError = errors.New("error reading")
+	UPDATE_INTERVAL = float64(10)
 
 	// this is just a flag for logging the transitions
 	Master bool
@@ -38,18 +38,18 @@ var (
 )
 
 // Atomic setting of master, returning True if we got it
-// Sets a 15sec TTL on the master key
+// The master key will have a TTL of 1.5x UPDATE_INTERVAL
 var (
 	atomicCheck = `local master = redis.call("GET", "cronstalk:master")
 if (not master) or (master == ARGV[1])
 then
-	redis.call("SET", "cronstalk:master", ARGV[1], "EX", 15)
+	redis.call("SET", "cronstalk:master", ARGV[1], "EX", %d)
 	return 1
 else
 	return 0
 end
 `
-	CheckMaster = redis.NewScript(0, atomicCheck)
+	CheckMaster = redis.NewScript(0, fmt.Sprintf(atomicCheck, int(UPDATE_INTERVAL*1.5)))
 )
 
 // generate a random Id for tracking the master
