@@ -144,18 +144,29 @@ func Schedule(job *CronJob) {
 	logDebug("scheduling job", job)
 	go func() {
 		start := job.NextSubmitTime()
-		logDebug(job.Key, "sleeping until", start)
-		time.Sleep(start.Sub(time.Now()))
 
-		ticker := time.NewTicker(job.Interval)
+		logDebug(job.Key, "sleeping until", start)
+
+		// delay using an After channel, so this job can still be canceled
+		// before the first Submit
+		delay := time.After(start.Sub(time.Now()))
+
+		// initialize a real ticker once we reach our start time. we need this
+		// empty Ticker to get a Ticker.C for the select
+		ticker := &time.Ticker{}
+
 		for {
-			Submit(job)
 			select {
-			case <-ticker.C:
+			case <-delay:
+				ticker = time.NewTicker(job.Interval)
 			case <-job.stop:
 				logDebug("exiting scheduler for", job)
+				ticker.Stop()
 				return
+			case <-ticker.C:
 			}
+
+			Submit(job)
 		}
 	}()
 }
